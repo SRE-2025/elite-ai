@@ -80,7 +80,7 @@ const WANTS_WEB = /research|fact|verif|check|opinion|current|latest|recent|news|
 
 // ---- One AI call, recorded as a step --------------------------------------------
 
-async function runStep(ctx, step, { system, messages, toFinal = false, maxTokens }) {
+async function runStep(ctx, step, { system, messages, toFinal = false, maxTokens, sealed = false }) {
   step.status = 'working';
   step.output = '';
   ctx.update();
@@ -90,7 +90,7 @@ async function runStep(ctx, step, { system, messages, toFinal = false, maxTokens
       messages,
       maxTokens,
       signal: ctx.signal,
-      search: step.provider !== 'perplexity' && hasWeb(step.provider, ctx.settings) && WANTS_WEB.test(`${step.role} ${step.instruction || ''} ${ctx.task}`),
+      search: !sealed && step.provider !== 'perplexity' && hasWeb(step.provider, ctx.settings) && WANTS_WEB.test(`${step.role} ${step.instruction || ''} ${ctx.task}`),
       onToken: (_, full) => {
         step.output = full;
         if (toFinal) ctx.msg.content = full;
@@ -216,7 +216,7 @@ function writerPrompt(ctx, steps) {
   };
 }
 
-async function writeFinal(ctx, steps, avail) {
+async function writeFinal(ctx, steps, avail, { huddle = false } = {}) {
   const { msg, settings } = ctx;
   const tried = [];
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -227,7 +227,7 @@ async function writeFinal(ctx, steps, avail) {
     msg.writer = step;
     msg.phase = `${P[writer].name} is writing the final answer`;
     await runStep(ctx, step, {
-      system: `You are ${who(writer)}, the final writer for Elite AI. ${T.INTRO} Teammates have each completed part of the user's request. Write the single best final answer, directly to the user:
+      system: `You are ${who(writer)}, the final writer for Elite AI. ${T.INTRO} ${huddle ? 'Your teammates just talked the request through with each other in a private huddle. Write the single best final answer from where the team landed, directly to the user:\n- If a real disagreement remains, add a short "Where the team disagreed" note with each side in one line.' : "Teammates have each completed part of the user's request. Write the single best final answer, directly to the user:"}
 - Merge their work into one clear, well-organized answer.
 - Where teammates disagree, go with the better-supported view and briefly say so.
 - Keep useful source links as Markdown links. Never invent sources.
@@ -236,6 +236,7 @@ async function writeFinal(ctx, steps, avail) {
 ${FORMAT}`,
       ...writerPrompt(ctx, steps),
       toFinal: true,
+      sealed: huddle,
     });
     if (step.status === 'done') {
       if (tried.length > 1) noteSubstitution(msg, 'Final writer', tried[0], writer, msg.failed.at(-1)?.error);
@@ -484,4 +485,79 @@ export async function blindSolo(ctx, provider) {
     messages: chatHistory(ctx.history, ctx.task),
   });
   if (step.status !== 'done') msg.blind = null; // a failed check is simply skipped
+}
+
+// ---- Huddle: the AIs talk to each other inside the app -------------------------------------
+// A sealed team room. Every message goes from one AI to the others through Elite AI itself: no
+// web search, no outside sites, nothing but the connected AIs. Each round, every AI reads the
+// room and replies to teammates by name; when they all agree (or the rounds run out), the final
+// writer turns where the team landed into one answer.
+
+const STANCE = /STANCE:\s*(agree|object)\b\s*(?:[—–:-]\s*)?(.*)$/im;
+
+export function stanceOf(text) {
+  const m = String(text || '').match(STANCE);
+  return m ? { stance: m[1].toLowerCase(), reason: m[2].trim().slice(0, 200) } : { stance: null, reason: '' };
+}
+
+export const stripStance = (text) => String(text || '').replace(/\n?\s*STANCE:[^\n]*\s*$/i, '').trim();
+
+export function mentionsOf(text, avail, self) {
+  const t = String(text || '');
+  return avail.filter((id) => id !== self && new RegExp(`@${P[id].name}\\b|\\b${P[id].name}\\b[,:]`, 'i').test(t));
+}
+
+function huddleRoom(msg, beforeRound) {
+  return msg.steps
+    .filter((m) => m.round < beforeRound && m.status === 'done')
+    .map((m) => `[Round ${m.round + 1}] ${P[m.provider].name}: ${clip(m.output, 1400)}`)
+    .join('\n\n');
+}
+
+function huddlePrompt(ctx, post, avail, rounds) {
+  const p = P[post.provider];
+  const others = avail.filter((id) => id !== post.provider).map((id) => P[id].name).join(', ');
+  const room = huddleRoom(ctx.msg, post.round);
+  return {
+    system: `You are ${who(post.provider)} in an Elite AI huddle: a private team room inside the app where you, ${others} talk the user's request through with each other. Nobody in the room can browse the web or reach any outside site — work from what you know and what teammates say, and say so when something needs checking. Today's date is ${todayLong()}. Your strength on this team: ${p.champion}.
+Rules:
+- Talk to your teammates, not the user. Address them by name, e.g. "@Claude, …".
+- ${post.round === 0 ? 'This is round 1: give your opening take from your specialty — key points, numbers, risks, what you would recommend.' : 'React to specific teammates: agree, correct mistakes, fill gaps, or ask someone a direct question. Never repeat what has already been said.'}
+- Keep it under 140 words.
+- End with exactly one line: "STANCE: agree" if you are satisfied with where the team has landed, or "STANCE: object — <the one thing you'd change>".`,
+    messages: [{
+      role: 'user',
+      content: `${contextBlock(ctx.history)}User's request:\n${ctx.task}\n\n${post.round === 0 ? 'Post your opening message to the team.' : `The room so far:\n\n${room}\n\nPost your next message to the team (round ${post.round + 1} of ${rounds}).`}`,
+    }],
+    maxTokens: 900,
+    sealed: true,
+  };
+}
+
+export async function runHuddle(ctx) {
+  const { msg, settings } = ctx;
+  const avail = ctx.avail || available(settings);
+  if (avail.length < 2) throw new Error('A huddle needs at least two AIs — connect another one in Settings.');
+  const rounds = Math.min(4, Math.max(2, Number(settings.huddleRounds) || 3));
+  msg.category = classify(ctx.task);
+  msg.steps = [];
+  msg.huddle = { rounds, members: [...avail], consensus: false };
+
+  for (let round = 0; round < rounds; round++) {
+    msg.phase = round === 0 ? 'Opening thoughts' : `Huddle round ${round + 1} of ${rounds}`;
+    const posts = avail.map((id) => newStep(id, 'Huddle', { round, roomMsg: true }));
+    msg.steps.push(...posts);
+    ctx.update();
+    await Promise.all(posts.map((post) => runStep(ctx, post, huddlePrompt(ctx, post, avail, rounds))));
+    for (const post of posts.filter((x) => x.status === 'done')) {
+      Object.assign(post, stanceOf(post.output), { to: mentionsOf(post.output, avail, post.provider) });
+    }
+    const spoke = posts.filter((x) => x.status === 'done');
+    if (!spoke.length) throw new Error(posts.map((x) => x.error).filter(Boolean).join(' • ') || 'Nobody could speak in the huddle.');
+    if (round > 0 && spoke.every((x) => x.stance === 'agree')) { msg.huddle.consensus = true; break; }
+  }
+  const open = msg.steps.filter((x) => x.status === 'done' && x.stance === 'object' && x.round === Math.max(...msg.steps.map((y) => y.round)));
+  msg.huddle.objections = open.map((x) => ({ provider: x.provider, reason: x.reason }));
+  await writeFinal(ctx, msg.steps.filter((x) => x.status === 'done'), avail, { huddle: true });
+  collectSources(msg);
 }

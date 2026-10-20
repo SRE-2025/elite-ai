@@ -104,14 +104,60 @@ export const OPENROUTER = {
   creditsUrl: 'https://openrouter.ai/settings/credits',
 };
 
+// ---- Private & offline connections ---------------------------------------------
+// Offline: open-weight models running on this computer (Ollama, LM Studio, llama.cpp, vLLM) over
+// an OpenAI-compatible API. Only some seats have an open-weight family — Claude has none, and the
+// newest ChatGPT, Gemini and Grok models only run on their companies' servers.
+export const LOCAL_FAMILIES = {
+  openai: { label: "OpenAI's open model gpt-oss", suggest: 'gpt-oss:20b', match: /gpt-oss/i },
+  google: { label: "Google's open model Gemma", suggest: 'gemma3:12b', match: /gemma/i },
+  deepseek: { label: "DeepSeek's open models", suggest: 'deepseek-r1:14b', match: /deepseek/i },
+  xai: { label: "xAI's open Grok weights (very large)", suggest: '', match: /grok/i },
+};
+export const LOCAL_DEFAULT_URL = 'http://localhost:11434/v1';
+
+// A company deployment can pin settings in config.js (see tools/configure.mjs and ENTERPRISE.md).
+export const DEPLOY = (typeof window !== 'undefined' && window.ELITE_CONFIG) || null;
+
+const trimBase = (u) => String(u || '').trim().replace(/\/+$/, '');
+
 // ---- Connections -------------------------------------------------------------
 
-// A provider's own key wins; otherwise an OpenRouter key can reach it.
+// Order of precedence: offline (this computer) → company gateway → the AI company's own key →
+// OpenRouter. Offline and gateway modes are exclusive: only seats they can serve are on the team.
 export function connection(id, settings) {
+  const local = settings.local;
+  if (local?.on) {
+    const model = local.models?.[id];
+    return model ? { via: 'local', key: '', base: trimBase(local.url || LOCAL_DEFAULT_URL), model } : null;
+  }
+  const gw = settings.gateway;
+  if (gw?.on && gw.url) {
+    const model = gw.models?.[id];
+    return model ? { via: 'gateway', key: gw.key || '', base: trimBase(gw.url), model } : null;
+  }
   const keys = settings.keys || {};
   if (keys[id]) return { via: 'direct', key: keys[id] };
   if (keys.openrouter) return { via: 'openrouter', key: keys.openrouter };
   return null;
+}
+
+// The outside hosts the app is allowed to reach in Sealed mode: exactly the connected AIs.
+export function allowedHosts(settings) {
+  const hosts = new Set();
+  // The local AI or company gateway itself is always reachable once switched on, even before any
+  // seat is assigned (otherwise "Find models" could never run).
+  for (const [on, url] of [[settings.local?.on, settings.local?.url || LOCAL_DEFAULT_URL], [settings.gateway?.on, settings.gateway?.url]]) {
+    if (on && url) { try { hosts.add(new URL(url).host); } catch { /* malformed URL */ } }
+  }
+  for (const p of PROVIDERS) {
+    const c = connection(p.id, settings);
+    if (!c) continue;
+    try {
+      hosts.add(new URL(c.via === 'openrouter' ? OPENROUTER.base : c.base || p.base).host);
+    } catch { /* malformed custom URL — nothing to allow */ }
+  }
+  return hosts;
 }
 
 export const isOn = (id, settings) => !!connection(id, settings) && !settings.off?.[id];
@@ -123,6 +169,10 @@ export const modelKey = (id, via) => `${id}:${via}`;
 // tool (or OpenRouter's web plugin) and Gemini uses Google Search grounding, each when switched on.
 // Everyone else answers from training data.
 export function hasWeb(id, settings) {
+  // Sealed, offline and gateway modes never search the web: the AIs only talk to each other.
+  if (settings.sealed) return false;
+  const via = connection(id, settings)?.via;
+  if (via === 'local' || via === 'gateway') return false;
   if (id === 'perplexity') return true;
   if (id === 'openai') return settings.openaiSearch !== false;
   if (id === 'google') return !!settings.geminiSearch;
@@ -132,6 +182,7 @@ export function hasWeb(id, settings) {
 export function modelFor(id, settings) {
   const conn = connection(id, settings);
   if (!conn) return null;
+  if (conn.model) return conn.model;
   const saved = settings.models?.[modelKey(id, conn.via)];
   if (saved) return saved;
   return conn.via === 'openrouter' ? P[id].orPrefix + P[id].orFallback : P[id].fallbackModel;
@@ -166,6 +217,9 @@ export async function listModels(id, settings) {
   const name = baseName(p, conn.via);
   let list;
 
+  if (conn.via === 'local' || conn.via === 'gateway') {
+    return listPrivateModels(conn.base, conn.key);
+  }
   if (conn.via === 'openrouter') {
     const all = await openRouterCatalog();
     list = all.filter((m) => m.id.startsWith(p.orPrefix) && !m.id.includes(':')).map((m) => ({ id: m.id, created: m.created }));
@@ -191,6 +245,14 @@ export async function listModels(id, settings) {
     }
   }
   return list.filter((m) => !p.exclude || !p.exclude.test(name(m))).sort(newestFirst(name));
+}
+
+// Models served by this computer or a company gateway (any OpenAI-compatible /models endpoint).
+export async function listPrivateModels(base, key = '') {
+  const res = await fetch(trimBase(base) + '/models', { headers: key ? { Authorization: 'Bearer ' + key } : {} });
+  if (!res.ok) throw await apiError(res, base.includes('localhost') || base.includes('127.0.0.1') ? 'Local AI' : 'Gateway');
+  const j = await res.json();
+  return (j.data || j.models || []).map((m) => ({ id: m.id || m.name || m.model })).filter((m) => m.id);
 }
 
 // Picks a strong, sensibly priced default: the newest model in the provider's preferred family.
@@ -321,11 +383,12 @@ const textOf = (content) => (typeof content === 'string' ? content
   : Array.isArray(content) ? content.map((x) => (x.type === 'text' || !x.type ? x.text || '' : '')).join('') : '');
 
 async function openaiCompat({ url, key, model, system, messages, emit, out, signal, headers = {}, includeUsage, name, extra }) {
+  if (!key) headers = { ...headers, Authorization: undefined };
   const body = { model, messages: [...(system ? [{ role: 'system', content: system }] : []), ...messages], stream: true, ...extra };
   if (includeUsage) body.stream_options = { include_usage: true };
   const init = () => ({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key, ...headers },
+    headers: Object.fromEntries(Object.entries({ 'Content-Type': 'application/json', Authorization: 'Bearer ' + key, ...headers }).filter(([, v]) => v !== undefined)),
     body: JSON.stringify(body),
     signal,
   });
@@ -467,7 +530,14 @@ export async function chat(id, settings, { system = '', messages, onToken, signa
   const args = { key: conn.key, model, system, messages, emit, out, signal, maxTokens, search };
 
   const send = async () => {
-  if (conn.via === 'openrouter') {
+  if (conn.via === 'local' || conn.via === 'gateway') {
+    await openaiCompat({
+      ...args,
+      url: conn.base + '/chat/completions',
+      includeUsage: conn.via === 'gateway',
+      name: `${p.name} (${conn.via === 'local' ? 'on this computer' : 'company gateway'})`,
+    });
+  } else if (conn.via === 'openrouter') {
     await openaiCompat({
       ...args,
       url: OPENROUTER.base + '/chat/completions',
@@ -513,7 +583,7 @@ export async function chat(id, settings, { system = '', messages, onToken, signa
   }
 
   out.ms = Math.round(performance.now() - t0);
-  out.cost = out.reportedCost ?? estimateCost(id, model, conn.via, out.usage);
+  out.cost = conn.via === 'local' ? 0 : out.reportedCost ?? estimateCost(id, model, conn.via, out.usage);
   if (!out.text.trim()) throw new Error(`${p.name} returned an empty answer.`);
   return out;
 }

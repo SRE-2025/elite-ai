@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://api.perplexity.ai https://api.x.ai https://api.mistral.ai https://api.deepseek.com https://openrouter.ai; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com https://api.perplexity.ai https://api.x.ai https://api.mistral.ai https://api.deepseek.com https://openrouter.ai http://localhost:11434 http://127.0.0.1:11434 http://localhost:1234 http://127.0.0.1:1234; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'">
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>Elite AI</title>
 <meta name="description" content="Every great AI, working together. Elite AI puts ChatGPT, Claude, Gemini, Grok and DeepSeek on one team and credits each for what it does best.">
@@ -58,6 +58,7 @@
 
     <nav class="modes" role="tablist" aria-label="How the AIs work together">
       <button role="tab" data-mode="team">Elite Team</button>
+      <button role="tab" data-mode="huddle">Huddle</button>
       <button role="tab" data-mode="compare">Compare</button>
       <button role="tab" data-mode="crosscheck">Cross-check</button>
       <button role="tab" data-mode="direct">Direct</button>
