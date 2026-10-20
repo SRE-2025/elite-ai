@@ -2,6 +2,7 @@
 // never from an AI describing its own work.
 
 import { P, available, chat, hasWeb } from './providers.js';
+import { classify, plannerHints, pickTryout, CATEGORIES } from './learning.js';
 
 // Default first choice for each team role, from public leaderboards (see EVIDENCE in providers.js,
 // reviewed 2026-10-20). A Champion Audit replaces these with the user's own measured rankings.
@@ -126,7 +127,8 @@ function newStep(provider, role, extra = {}) {
 
 // ---- Elite Team ----------------------------------------------------------------------
 
-export function plannerSystem(avail, settings) {
+export function plannerSystem(avail, settings, hints = '') {
+  const allFive = settings.allFive && avail.length > 1;
   return `You are the planner for Elite AI. ${T.INTRO}
 
 Plan how the team should handle the user's latest request.
@@ -134,15 +136,15 @@ Plan how the team should handle the user's latest request.
 - Add a member only when their specialty clearly improves the answer: live web research for anything current (news, prices, recent facts, local info); a specialist for code, math, translation or a second perspective.
 - Anything that needs current information must go to a member that HAS live web search. Members without it only know what they learned in training.
 - Prefer members whose measured audit results show they are best at the skill a step needs.
-- At most 3 steps — every extra AI adds time and cost. Steps with no dependencies run in parallel; a step can build on earlier steps via depends_on.
+${allFive ? `- The user has switched on ALL FIVE mode: give EVERY team member exactly one step that fits its specialty (${avail.length} steps), so all of them contribute (this overrides the fewest-members rule). DeepSeek may only draft math, code or structure — never facts.\n` : ''}- ${allFive ? `At most ${avail.length} steps.` : 'At most 3 steps — every extra AI adds time and cost.'} Steps with no dependencies run in parallel; a step can build on earlier steps via depends_on.
 - Do NOT add a final "combine / summarize / write the answer" step — the team's final writer does that automatically.
 - Set "verify" to true only when the request is high-stakes or fact-heavy enough to justify an independent check (health, money, legal, safety, important facts, code that must run).
 
 Team members:
 ${avail.map((id) => memberLine(id, settings)).join('\n')}
-
+${hints ? `\n${hints}\n` : ''}
 Reply with ONLY this JSON — no code fences, no commentary:
-{"complexity":"simple|moderate|complex","reason":"one short sentence on why this team","verify":false,"steps":[{"id":"s1","assignee":"<member id>","role":"<2-3 word role>","instruction":"<exactly what this member should produce>","depends_on":[]}]}`;
+{"complexity":"simple|moderate|complex","category":"${Object.keys(CATEGORIES).join('|')}","reason":"one short sentence on why this team","verify":false,"steps":[{"id":"s1","assignee":"<member id>","role":"<2-3 word role>","instruction":"<exactly what this member should produce>","depends_on":[]}]}`;
 }
 
 const ALIASES = { chatgpt: 'openai', gpt: 'openai', claude: 'anthropic', gemini: 'google', grok: 'xai', 'x-ai': 'xai' };
@@ -154,7 +156,7 @@ export function parsePlan(text, avail) {
   try { j = JSON.parse(m[0]); } catch { return null; }
   const idMap = {};
   const steps = [];
-  for (const [i, s] of (Array.isArray(j.steps) ? j.steps : []).slice(0, 4).entries()) {
+  for (const [i, s] of (Array.isArray(j.steps) ? j.steps : []).slice(0, 5).entries()) {
     let prov = String(s.assignee || '').toLowerCase().trim();
     prov = ALIASES[prov] || prov;
     if (!avail.includes(prov)) continue;
@@ -167,7 +169,7 @@ export function parsePlan(text, avail) {
     steps.push(step);
   }
   if (!steps.length) return null;
-  return { steps, reason: clip(String(j.reason || ''), 300), verify: j.verify === true };
+  return { steps, reason: clip(String(j.reason || ''), 300), verify: j.verify === true, category: CATEGORIES[j.category] ? j.category : null };
 }
 
 function defaultPlan(avail, settings) {
@@ -308,12 +310,14 @@ export async function runTeam(ctx) {
   if (!avail.length) throw new Error('No AIs are connected yet — add a key in Settings.');
 
   let plan = null;
+  // Exploration (ChatGPT's review): now and then another AI gets a turn so a favourite can't lock in.
+  msg.tryout = settings.allFive ? null : pickTryout(classify(ctx.task), avail);
   if (avail.length > 1) {
     const planner = pick('plan', avail, settings);
     msg.planner = newStep(planner, 'Planner');
     msg.phase = `${P[planner].name} is planning the team`;
     await runStep(ctx, msg.planner, {
-      system: plannerSystem(avail, settings),
+      system: plannerSystem(avail, settings, plannerHints(classify(ctx.task), avail, Object.fromEntries(avail.map((id) => [id, P[id].name])), msg.tryout)),
       messages: [{ role: 'user', content: contextBlock(ctx.history) + 'Latest request:\n' + ctx.task }],
       maxTokens: 1500,
     });
@@ -323,6 +327,7 @@ export async function runTeam(ctx) {
     }
   }
   plan ||= defaultPlan(avail, settings);
+  msg.category = plan.category || classify(ctx.task);
   msg.reason = plan.reason;
   msg.steps = plan.steps;
   ctx.update();
@@ -354,6 +359,7 @@ export async function runTeam(ctx) {
 
 export async function runCompare(ctx) {
   const { msg } = ctx;
+  msg.category = classify(ctx.task);
   const ids = ctx.avail;
   if (!ids.length) throw new Error('No AIs are connected yet — add a key in Settings.');
   msg.steps = ids.map((id) => newStep(id, 'Answer'));
@@ -378,6 +384,7 @@ export async function mergeCompare(ctx) {
 
 export async function runCrossCheck(ctx) {
   const { msg, settings } = ctx;
+  msg.category = classify(ctx.task);
   const avail = ctx.avail;
   if (!avail.length) throw new Error('No AIs are connected yet — add a key in Settings.');
   const drafter = pick('write', avail, settings);
@@ -425,6 +432,7 @@ export async function runCrossCheck(ctx) {
 
 export async function runDirect(ctx) {
   const { msg } = ctx;
+  msg.category = classify(ctx.task);
   const id = ctx.provider;
   const step = newStep(id, 'Answer');
   msg.steps = [step];
@@ -461,4 +469,19 @@ Then up to 5 short bullets naming specific issues (quote the claim). If nothing 
     maxTokens: 1200,
   });
   collectSources(msg);
+}
+
+// ---- Blind check (learning loop) ----------------------------------------------------------------
+// One AI answers the same request alone, so the user can compare it with the team's answer
+// without knowing which is which — a real counterfactual instead of a guess.
+export async function blindSolo(ctx, provider) {
+  const { msg } = ctx;
+  const step = newStep(provider, 'Blind check', { blindCheck: true, order: Math.random() < 0.5 ? 'team-first' : 'solo-first' });
+  msg.blind = step;
+  msg.phase = 'Preparing a blind check';
+  await runStep(ctx, step, {
+    system: `You are ${who(provider)}. Today's date is ${todayLong()}. Answer the user directly and helpfully. ${FORMAT}`,
+    messages: chatHistory(ctx.history, ctx.task),
+  });
+  if (step.status !== 'done') msg.blind = null; // a failed check is simply skipped
 }

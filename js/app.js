@@ -1,10 +1,11 @@
 import { PROVIDERS, RESERVES, EVIDENCE, P, OPENROUTER, connection, available, modelFor, modelKey, listModels, autoPick, loadPrices, hasWeb } from './providers.js';
-import { runTeam, runCompare, mergeCompare, runCrossCheck, runDirect, secondOpinion, pick, ROLE_LABELS, redoStep, suggestReplacement } from './orchestrator.js';
+import { runTeam, runCompare, mergeCompare, runCrossCheck, runDirect, secondOpinion, pick, ROLE_LABELS, redoStep, suggestReplacement, blindSolo } from './orchestrator.js';
 import { SKILLS, SKILL, TASKS, estimateAudit, runAudit, saveRun, loadRuns, summarizeRuns, rankings, perAI, recommend, confidence, isTop } from './audit.js';
 import { renderMarkdown, esc } from './markdown.js';
 import { store } from './store.js';
+import { CATEGORIES, MIN_SIGNALS, BLIND_RATE, recordOutcome, signal, blindResult, personalStats, rankedFor, personalChampion, suggestion, exportOutcomes, resetOutcomes } from './learning.js';
 
-const VERSION = '0.2.0 beta';
+const VERSION = '0.3.0 beta';
 
 const MODES = {
   team: { label: 'Elite Team', hint: 'The planner picks the best AI for each part of your task, then one final answer — with credits.' },
@@ -27,7 +28,7 @@ const EXAMPLES = [
 const DEFAULTS = {
   keys: {}, models: {}, off: {}, roles: { plan: 'auto', write: 'auto', verify: 'auto' },
   geminiSearch: true, openaiSearch: true, dailyCap: 5, mode: 'team', directProvider: null, welcomed: false,
-  useAudit: false, routing: null, measured: null, auditAt: null,
+  useAudit: false, routing: null, measured: null, auditAt: null, allFive: false, learningChecks: 'some',
 };
 const loaded = store.read('settings', {});
 const settings = { ...DEFAULTS, ...loaded, roles: { ...DEFAULTS.roles, ...(loaded.roles || {}) } };
@@ -92,13 +93,13 @@ function toast(text, ms = 2600) {
 // ---- Credits & totals (from the execution log only) -------------------------------------------
 
 function allCalls(msg) {
-  return [msg.planner, ...(msg.steps || []), msg.writer, ...(msg.checks || []), ...(msg.failed || [])].filter(Boolean);
+  return [msg.planner, ...(msg.steps || []), msg.writer, ...(msg.checks || []), ...(msg.failed || []), msg.blind].filter(Boolean);
 }
 
 function credits(msg) {
   const map = new Map();
   for (const s of allCalls(msg)) {
-    if (s.status !== 'done' || s.superseded) continue;
+    if (s.status !== 'done' || s.superseded || s.blindCheck) continue;
     if (!map.has(s.provider)) map.set(s.provider, []);
     const roles = map.get(s.provider);
     if (!roles.includes(s.role)) roles.push(s.role);
@@ -225,7 +226,7 @@ function renderSources(msg) {
   if (!msg.sources?.length) return '';
   const key = `src-${msg.id}`;
   return `<details class="sources" data-key="${key}"${ui.open.has(key) ? ' open' : ''}><summary>Sources (${msg.sources.length})</summary><ol>${
-    msg.sources.map((s) => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title && s.title !== domain(s.url) ? s.title : domain(s.url))}</a> <small>${esc(domain(s.url))} · via ${esc(P[s.provider].name)}</small></li>`).join('')
+    msg.sources.map((s) => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" data-act="src" data-mid="${msg.id}" data-pid="${s.provider}">${esc(s.title && s.title !== domain(s.url) ? s.title : domain(s.url))}</a> <small>${esc(domain(s.url))} · via ${esc(P[s.provider].name)}</small></li>`).join('')
   }</ol></details>`;
 }
 
@@ -251,6 +252,7 @@ function renderAssistant(msg) {
   const t = totals(msg);
   const answerStreaming = running && msg.content;
   return `<article class="msg ai ${msg.status}" data-mid="${msg.id}">
+    ${msg.tryout && credits(msg).some(([id]) => id === msg.tryout) ? `<div class="muted small">🔬 Tryout: ${esc(P[msg.tryout].name)} got a turn on this task so the rankings stay honest.</div>` : ''}
     <div class="credits"><span class="mode-tag">${esc(MODES[msg.mode]?.label || '')}</span>${team.map(([id, roles]) => chip(id, roles.join(' + '))).join('')}</div>
     ${running ? `<div class="progress"><span class="spin"></span>${esc(msg.phase || 'Working')}…</div>${(msg.mode === 'team' || msg.mode === 'crosscheck') && !msg.content ? renderLiveTeam(msg) : ''}` : ''}
     ${msg.mode === 'compare' && msg.steps?.length ? renderCompare(msg) : ''}
@@ -267,7 +269,45 @@ function renderAssistant(msg) {
       ${msg.content && available(settings).length > 1 ? `<button class="btn sm ghost" data-act="second" data-mid="${msg.id}">Get a second opinion</button>` : ''}
       ${msg.mode === 'direct' && t.calls ? `<span class="muted small">${esc(stepMeta(msg.steps[0]))}</span>` : ''}
     </div>` : ''}
+    ${renderBlind(msg)}
   </article>`;
+}
+
+const names = () => Object.fromEntries(PROVIDERS.map((p) => [p.id, p.name]));
+
+// Blind check (learning loop): the team's answer next to one AI's answer, unlabeled, so the user
+// judges two answers they can actually see. ChatGPT asked "was the team better than one AI?";
+// Gemini pointed out nobody can judge an answer they never saw — this does both.
+function renderBlind(msg) {
+  const b = msg.blind;
+  if (!b || msg.status !== 'done' || !msg.content) return '';
+  const teamFirst = b.order === 'team-first';
+  const [A, B] = teamFirst ? [msg.content, b.output] : [b.output, msg.content];
+  const winner = b.verdict;
+  const label = (x) => (x === 'team' ? 'the Elite Team' : x === 'solo' ? `${P[b.provider].name} alone` : '');
+  const reveal = winner ? `<p class="small">${winner === 'same' ? 'You called it even.' : `You picked ${label(winner)}.`} Answer A was ${label(teamFirst ? 'team' : 'solo')}; Answer B was ${label(teamFirst ? 'solo' : 'team')}. Thanks — your team learns from this.</p>` : '';
+  const tip = winner && winner !== 'team' ? suggestion(msg.category, available(settings), names()) : null;
+  const keyA = `bl-a-${msg.id}`, keyB = `bl-b-${msg.id}`;
+  return `<div class="blind">
+    <div class="blind-head"><b>🔬 Blind check</b><span class="muted small">Same request, two answers, no names. Which helps you more?</span></div>
+    <details data-key="${keyA}"${ui.open.has(keyA) ? ' open' : ''}><summary>Answer A</summary><div class="md">${renderMarkdown(A)}</div></details>
+    <details data-key="${keyB}"${ui.open.has(keyB) ? ' open' : ''}><summary>Answer B</summary><div class="md">${renderMarkdown(B)}</div></details>
+    <div class="fb-row">${[['A', 'A is better'], ['same', 'About the same'], ['B', 'B is better']].map(([v, t]) => {
+      const meaning = v === 'same' ? 'same' : (v === 'A') === teamFirst ? 'team' : 'solo';
+      return `<button class="mini${winner === meaning ? ' on' : ''}" data-act="blind-vote" data-mid="${msg.id}" data-v="${meaning}">${t}</button>`;
+    }).join('')}</div>${reveal}</div>
+    ${tip ? `<div class="tip-line">💡 ${esc(tip)}</div>` : ''}`;
+}
+
+// Run a blind check on about 1 in 8 team answers (Settings can switch this off).
+async function maybeBlind(ctx) {
+  const { msg } = ctx;
+  const mode = settings.learningChecks === false ? 'off' : settings.learningChecks === true ? 'some' : settings.learningChecks || 'some';
+  if (mode === 'off' || !msg.content || credits(msg).length < 2) return;
+  if (mode !== 'all' && Math.random() >= BLIND_RATE) return;
+  const avail = available(settings);
+  const solo = personalChampion(msg.category, avail)?.pid || msg.writer?.provider || pick('write', avail, settings);
+  if (solo) await blindSolo(ctx, solo);
 }
 
 const renderMsg = (msg) => (msg.role === 'user' ? renderUser(msg) : renderAssistant(msg));
@@ -335,14 +375,16 @@ function renderComposer() {
     if (!conn) return `<button class="pill ghost" data-act="settings" title="Connect ${esc(p.name)}">${badge(p.id, 'sm')}${esc(p.name)} <i>+</i></button>`;
     const on = direct ? p.id === chosen : !settings.off[p.id];
     return `<button class="pill${on ? ' on' : ''}" style="--c:${p.color}" data-act="${direct ? 'pick-direct' : 'toggle-ai'}" data-id="${p.id}" aria-pressed="${on}" title="${esc(p.champion)}">${badge(p.id, 'sm')}${esc(p.name)}</button>`;
-  }).join('');
+  }).join('') + (mode === 'team' && avail.length > 2
+    ? `<button class="pill all5${settings.allFive ? ' on' : ''}" data-act="all-five" aria-pressed="${!!settings.allFive}" title="Every AI contributes on every task — slower and costs more">✦ All ${avail.length}</button>`
+    : '');
 
   let who = '';
   if (avail.length) {
     if (mode === 'team') {
       const planner = avail.length > 1 ? pick('plan', avail, settings) : null;
       const writer = pick('write', avail, settings);
-      who = !planner ? `${P[avail[0]].name} answers` : planner === writer ? `${P[planner].name} plans and writes the final answer · specialists in between` : `${P[planner].name} plans · ${P[writer].name} writes the final answer`;
+      who = settings.allFive && avail.length > 2 ? `All ${avail.length} AIs contribute on every task (slower, costs more)` : !planner ? `${P[avail[0]].name} answers` : planner === writer ? `${P[planner].name} plans and writes the final answer · specialists in between` : `${P[planner].name} plans · ${P[writer].name} writes the final answer`;
     } else if (mode === 'compare') who = `${avail.length} AI${avail.length > 1 ? 's' : ''} answer side by side`;
     else if (mode === 'crosscheck') {
       const d = pick('write', avail, settings);
@@ -421,6 +463,7 @@ async function guarded(msg, fn) {
   }
   msg.ms = (msg.ms || 0) + Math.round(performance.now() - t0);
   msg.phase = '';
+  if (msg.status === 'done') recordOutcome(msg);
   ui.controller = null;
   ui.runningMsg = null;
   const t = thread();
@@ -470,7 +513,7 @@ async function send(text) {
     if (mode === 'compare') return runCompare(ctx);
     if (mode === 'crosscheck') return runCrossCheck(ctx);
     if (mode === 'direct') return runDirect({ ...ctx, provider: directProvider() });
-    return runTeam(ctx);
+    return runTeam(ctx).then(() => maybeBlind(ctx));
   });
 }
 
@@ -593,6 +636,7 @@ function settingsBody() {
     <p class="muted small">${settings.useAudit ? `“Auto” uses your Champion Audit from ${esc(new Date(settings.auditAt).toLocaleDateString())}.` : '“Auto” uses public reputation until you run a Champion Audit.'} <button class="link" data-act="audit">${settings.useAudit ? 'See audit' : 'Run a Champion Audit'}</button></p>
     <div class="row wrap">${roleSelect('plan')}${roleSelect('write')}${roleSelect('verify')}</div>
     <label class="check-label"><input type="checkbox" data-act="osearch"${settings.openaiSearch !== false ? ' checked' : ''}> Let ChatGPT search the web on research and fact-check steps (it leads the search benchmarks; OpenAI bills searches separately)</label>
+    <label class="field">Learning checks (blind A/B of the team vs one AI; each adds one AI call) <select data-act="lchecks">${[['some', `About 1 in ${Math.round(1 / BLIND_RATE)} team answers`], ['all', 'Every team answer (learns fastest)'], ['off', 'Off']].map(([v, t]) => `<option value="${v}"${(settings.learningChecks === true ? 'some' : settings.learningChecks === false ? 'off' : settings.learningChecks || 'some') === v ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
     <label class="check-label"><input type="checkbox" data-act="gsearch"${settings.geminiSearch ? ' checked' : ''}> Let Gemini search Google when it works (grounded answers with sources; Google may bill searches separately)</label>
   </section>
   <section class="set">
@@ -618,7 +662,7 @@ function settingsBody() {
   </section>
   <section class="set">
     <h3>About</h3>
-    <p class="muted small">Built by Claude (Anthropic) with design reviews from ChatGPT (OpenAI) and Gemini (Google): ChatGPT shaped Team Replay, second opinions, cost caps, failure recovery and the trust test; Gemini shaped evidence-based verification, the three-step cap and fresh audit numbers.</p>
+    <p class="muted small">Built by Claude (Anthropic) with design reviews from ChatGPT (OpenAI) and Gemini (Google): ChatGPT shaped Team Replay, second opinions, cost caps, failure recovery, the trust test, the learning loop, tryouts and All 5 mode; Gemini shaped evidence-based verification, the three-step cap, fresh audit numbers, personal routing, upstream credit and the case for blind checks.</p>
     <p class="muted small">Elite AI ${VERSION}. Credits, timings, tokens and costs come from the app's own execution log, never from an AI describing itself. When AIs work together, your request — and teammates' work on it — is sent to each AI company involved, under that company's own terms and privacy policy.</p>
     <p class="muted small">Elite AI is an independent app and is not affiliated with, sponsored or endorsed by OpenAI, Anthropic, Google, xAI, DeepSeek or OpenRouter. Product names belong to their owners and are used only to identify each service.</p>
   </section>`;
@@ -659,6 +703,39 @@ function teamBody() {
     <p>They stay on the reserve bench and can be promoted back if a future review shows they've caught up.</p>
     <p class="muted">Sources: ${EVIDENCE.sources.map(([label, url]) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`).join(' · ')}</p>
   </div></details>`;
+}
+
+// ---- Your Elite Index ------------------------------------------------------------------
+
+const CATEGORY_SKILL = { research: 'research', writing: 'writing', coding: 'coding', math: 'math', factcheck: 'factcheck', longdoc: 'longdoc', planning: 'planning', critique: 'critique', translation: 'translation' };
+
+function indexBody() {
+  const avail = available(settings);
+  const { stats, total } = personalStats();
+  const runs = loadRuns();
+  const ranks = runs.length ? rankings(summarizeRuns(runs, settings)) : {};
+  const cell = (pid, extra = '') => (pid ? `${chip(pid)}${extra ? `<small> ${extra}</small>` : ''}` : '<span class="muted">—</span>');
+  return `<p class="lead-sm">Who does each job is decided by three layers of evidence. The first two anyone could copy. <b>The third is yours alone</b> — it grows every time an answer passes a check, you rate an answer, open a source, pick a winner, or take a blind check.</p>
+  <div class="layers">
+    <div><span>1</span><b>Public leaderboards</b><small>${esc(EVIDENCE.date)}</small></div>
+    <div><span>2</span><b>Your Champion Audits</b><small>${runs.length} audit${runs.length === 1 ? '' : 's'}</small></div>
+    <div><span>3</span><b>Your everyday results</b><small>${total} task${total === 1 ? '' : 's'} learned from</small></div>
+  </div>
+  <div class="table-wrap"><table class="matrix index"><thead><tr><th>Task type</th><th>1 · Public pick</th><th>2 · Your audit</th><th>3 · Your results</th><th>Blind checks: team vs one AI</th></tr></thead><tbody>${
+    Object.entries(CATEGORIES).map(([cat, label]) => {
+      const mine = rankedFor(cat, avail)[0];
+      const audit = CATEGORY_SKILL[cat] ? ranks[CATEGORY_SKILL[cat]]?.[0] : null;
+      const team = stats[cat]?.team;
+      const votes = team ? team.better + team.same + team.worse : 0;
+      return `<tr><td><b>${esc(label)}</b><small>${stats[cat]?.tasks || 0} tasks</small></td>
+        <td>${cell(EVIDENCE.bestFor[cat])}</td>
+        <td>${audit ? cell(audit.pid, audit.score.toFixed(1)) : cell(null)}</td>
+        <td>${mine ? cell(mine.pid, `${Math.round(mine.score * 100)}% ±${Math.round(mine.spread * 100)} · ${Math.round(mine.n)} signals`) : `<span class="muted small">needs ${MIN_SIGNALS}+ signals</span>`}</td>
+        <td>${votes ? `<span class="small">👍 ${team.better} · = ${team.same} · 👎 ${team.worse}</span>` : '<span class="muted">—</span>'}</td></tr>`;
+    }).join('')}</tbody></table></div>
+  <p class="muted small"><b>How scores work:</b> answers that pass an independent check count double and credit everyone who built them; your 👍/👎 and best-answer picks count once; opening a source credits the AI that found it; copying or sharing counts as engagement, not a vote. An AI needs ${MIN_SIGNALS}+ signals and a clear lead before the planner treats it as your favourite, and about 1 in 10 tasks gives another AI a tryout so a favourite can't lock in. If blind checks keep showing the team is no better than one AI for a task type, the planner keeps it to one AI and Elite AI suggests Direct mode to save time and money.</p>
+  <p class="muted small">Private by design: this lives only on this device and stores no prompts or answers — just which AIs worked on what kind of task and how you rated them. Opt-in sharing to a community Elite Index is planned next; it is how Elite AI will get smarter for everyone.</p>
+  <div class="row wrap"><button class="btn sm ghost" data-act="index-export">Export my data</button><button class="btn sm ghost" data-act="index-reset">Reset learning</button><button class="btn sm ghost" data-act="audit">Champion audit</button></div>`;
 }
 
 // ---- Champion Audit screens ---------------------------------------------------------------
@@ -963,6 +1040,14 @@ async function copy(text, label = 'Copied') {
   try { await navigator.clipboard.writeText(text); toast(label); } catch { toast('Copy failed — select the text instead.'); }
 }
 
+function accepted(msg) {
+  if (msg.accepted) return;
+  msg.accepted = true;
+  const author = msg.writer?.provider || (msg.steps || []).find((s) => s.status === 'done' && !s.replacedBy)?.provider;
+  if (author) signal(msg.id, author, 'accept', 1);
+  saveThreads();
+}
+
 function plainCredits(msg) {
   return credits(msg).map(([id, roles]) => `${P[id].name} (${roles.join(' + ')})`).join(', ');
 }
@@ -1007,11 +1092,12 @@ const actions = {
     undoToast('Conversation deleted', () => { threads.push(gone); saveThreads(); renderAll(); });
   },
   'new-thread': () => newThread(),
-  copy: (el) => { const { msg } = findMsg(el.dataset.mid); if (msg) copy(msg.content + (credits(msg).length ? `\n\n— Elite AI · ${plainCredits(msg)}` : '')); },
+  copy: (el) => { const { msg } = findMsg(el.dataset.mid); if (msg) accepted(msg); if (msg) copy(msg.content + (credits(msg).length ? `\n\n— Elite AI · ${plainCredits(msg)}` : '')); },
   'copy-step': (el) => { const { msg } = findMsg(el.dataset.mid); const s = msg?.steps.find((x) => x.id === el.dataset.sid); if (s) copy(s.output); },
   share: async (el) => {
     const { msg } = findMsg(el.dataset.mid);
     if (!msg) return;
+    accepted(msg);
     try { await navigator.share({ title: 'Elite AI answer', text: msg.content + `\n\n— Elite AI · ${plainCredits(msg)}` }); } catch { /* cancelled */ }
   },
   second: (el) => openSecondOpinion(el.dataset.mid),
@@ -1022,11 +1108,48 @@ const actions = {
     const { msg } = findMsg(el.dataset.mid);
     if (!msg) return;
     const prev = msg.steps.find((s) => s.id === msg.best);
-    if (prev) scores[prev.provider] = { ...scores[prev.provider], best: Math.max(0, (scores[prev.provider]?.best || 0) - 1) };
+    if (prev) { scores[prev.provider] = { ...scores[prev.provider], best: Math.max(0, (scores[prev.provider]?.best || 0) - 1) }; signal(msg.id, prev.provider, 'best', -1); }
     const s = msg.steps.find((x) => x.id === el.dataset.sid);
     if (msg.best === s.id) msg.best = null;
-    else { msg.best = s.id; scores[s.provider] = { ...scores[s.provider], best: (scores[s.provider]?.best || 0) + 1 }; }
+    else { msg.best = s.id; scores[s.provider] = { ...scores[s.provider], best: (scores[s.provider]?.best || 0) + 1 }; signal(msg.id, s.provider, 'best', 1); }
     saveScores(); saveThreads(); scheduleMsg(msg);
+  },
+  'team-fb': (el) => {
+    const { msg } = findMsg(el.dataset.mid);
+    if (!msg) return;
+    msg.feedback = msg.feedback === el.dataset.v ? null : el.dataset.v;
+    teamFeedback(msg.id, el.dataset.v);
+    saveThreads();
+    scheduleMsg(msg);
+  },
+  'blind-vote': (el) => {
+    const { msg } = findMsg(el.dataset.mid);
+    if (!msg?.blind) return;
+    msg.blind.verdict = el.dataset.v;
+    blindResult(msg.id, el.dataset.v, msg.blind.provider);
+    saveThreads();
+    scheduleMsg(msg);
+  },
+  src: (el) => {
+    const { msg } = findMsg(el.dataset.mid);
+    if (!msg || !el.dataset.pid) return;
+    msg.clicked ||= [];
+    if (msg.clicked.includes(el.href)) return;
+    msg.clicked.push(el.href);
+    signal(msg.id, el.dataset.pid, 'source', 1);
+    saveThreads();
+  },
+  'all-five': () => {
+    settings.allFive = !settings.allFive;
+    saveSettings();
+    renderComposer();
+    toast(settings.allFive ? 'All five AIs will contribute on every task — slower and costs more.' : 'Back to evidence-based routing: only the AIs a task needs.', 3500);
+  },
+  'elite-index': () => { closeDrawer(); openSheet('Your Elite Index', indexBody, { wide: true }); },
+  'index-export': () => download(`elite-ai-index-${today()}.json`, JSON.stringify(exportOutcomes(), null, 2)),
+  'index-reset': (el) => {
+    if (el.dataset.armed !== '1') { el.dataset.armed = '1'; el.textContent = 'Tap again to reset'; return; }
+    resetOutcomes(); refreshSheet(); toast('Learning history reset.');
   },
   rate: (el) => {
     const { msg } = findMsg(el.dataset.mid);
@@ -1034,9 +1157,9 @@ const actions = {
     if (!s) return;
     const v = el.dataset.v;
     const sc = (scores[s.provider] ||= {});
-    if (s.rating) sc[s.rating] = Math.max(0, (sc[s.rating] || 0) - 1);
+    if (s.rating) { sc[s.rating] = Math.max(0, (sc[s.rating] || 0) - 1); signal(msg.id, s.provider, s.rating, -1); }
     s.rating = s.rating === v ? null : v;
-    if (s.rating) sc[s.rating] = (sc[s.rating] || 0) + 1;
+    if (s.rating) { sc[s.rating] = (sc[s.rating] || 0) + 1; signal(msg.id, s.provider, s.rating, 1); }
     saveScores(); saveThreads(); scheduleMsg(msg);
   },
   'save-key': (el) => saveKey(el.dataset.id),
@@ -1081,7 +1204,7 @@ document.addEventListener('click', (e) => {
   if (!el) return;
   const fn = actions[el.dataset.act];
   if (!fn) return;
-  if (el.tagName === 'A') return;
+  if (el.tagName === 'A') { fn(el, e); return; }
   if (el.dataset.act !== 'close-sheet') e.preventDefault();
   fn(el, e);
 });
@@ -1099,6 +1222,9 @@ document.addEventListener('change', (e) => {
   } else if (act === 'role') {
     settings.roles[el.dataset.role] = el.value;
     saveSettings(); renderComposer();
+  } else if (act === 'lchecks') {
+    settings.learningChecks = el.value;
+    saveSettings();
   } else if (act === 'osearch') {
     settings.openaiSearch = el.checked;
     saveSettings();

@@ -457,3 +457,21 @@ textarea.fb { width: 100%; resize: vertical; }
 .sub-note { padding: 7px 11px; border-radius: 10px; background: rgba(226,181,83,.08); border: 1px solid rgba(226,181,83,.35); font-size: 13.5px; overflow-wrap: anywhere; }
 .recovery { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px 11px; border-radius: 12px; background: var(--panel); border: 1px dashed var(--line-2); }
 .earlier { margin-top: 6px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
+.fb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13.5px; color: var(--muted); }
+.fb-row span:first-child { margin-right: 2px; }
+.tip-line { font-size: 13.5px; padding: 7px 11px; border-radius: 10px; background: rgba(90,214,143,.07); border: 1px solid rgba(90,214,143,.3); }
+.pill.all5 { color: var(--gold-2); border-style: dashed; }
+.pill.all5.on { border-style: solid; border-color: var(--gold); background: rgba(226,181,83,.14); color: var(--gold-2); }
+.layers { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 8px; margin: 10px 0 14px; }
+.layers > div { padding: 9px 12px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); }
+.layers > div:last-child { border-color: rgba(226,181,83,.55); }
+.layers span { display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--gold); color: var(--gold-ink); font-weight: 800; font-size: 11px; margin-right: 6px; }
+.layers small { display: block; color: var(--muted); margin-top: 3px; }
+.matrix.index td { text-align: left; white-space: normal; }
+.matrix.index td small { display: inline; }
+.blind { display: flex; flex-direction: column; gap: 8px; padding: 11px 12px; border-radius: 13px; border: 1px dashed rgba(226,181,83,.5); background: var(--bg-2); }
+.blind-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.blind details { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.blind summary { cursor: pointer; padding: 7px 10px; font-weight: 650; font-size: 14px; }
+.blind details .md { padding: 0 12px 10px; font-size: 14.5px; max-height: 360px; overflow-y: auto; }
+.blind p { margin: 0; }

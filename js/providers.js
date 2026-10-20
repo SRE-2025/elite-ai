@@ -9,6 +9,8 @@ import { store } from './store.js';
 export const EVIDENCE = {
   date: 'October 20, 2026',
   note: 'Leaderboards mostly test models at maximum effort settings, which can differ from everyday API defaults.',
+  // Public-evidence pick per task type (the starting point before audits and personal results).
+  bestFor: { research: 'openai', writing: 'anthropic', coding: 'anthropic', math: 'google', factcheck: 'google', longdoc: 'anthropic', planning: 'anthropic', critique: 'google', translation: 'google', general: 'anthropic' },
   sources: [
     ['LMArena (text, WebDev, Search, Agent arenas)', 'https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset'],
     ['Artificial Analysis (intelligence, long context, hallucination, cost)', 'https://artificialanalysis.ai/leaderboards/models'],
